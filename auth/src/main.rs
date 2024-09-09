@@ -1,3 +1,8 @@
+use std::{
+    fs::{self, File},
+    io::{Error, Write},
+};
+
 use argon2::{
     password_hash::{self, rand_core::OsRng, PasswordHasher, SaltString},
     Argon2, PasswordHash, PasswordVerifier,
@@ -5,12 +10,15 @@ use argon2::{
 
 use axum::{
     extract::Form,
+    http::StatusCode,
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio;
 use tower_http::trace::TraceLayer;
+
+static DB_PATH: &str = "db/users";
 
 #[tokio::main]
 async fn main() {
@@ -37,6 +45,18 @@ struct Login {
     password: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct UserPassHash {
+    user: String,
+    hash: String,
+}
+
+fn save_user(data: &UserPassHash) -> Result<(), Error> {
+    let json_data = serde_json::to_string(data)?;
+    let mut file = File::create(format!("{}/{}", DB_PATH, data.user))?;
+    file.write_all(json_data.as_bytes())
+}
+
 fn hash_password(password: &str) -> Result<String, password_hash::Error> {
     let argon2 = Argon2::default();
     let salt = SaltString::generate(OsRng);
@@ -54,27 +74,56 @@ fn verify_password(password: &str, hash: &str) -> Result<(), password_hash::Erro
     resp
 }
 
-async fn register(Form(login): Form<Login>) -> String {
-    let pswd_hash = hash_password(&login.password.as_str());
-    format!(
+async fn register(Form(login): Form<Login>) -> (StatusCode, String) {
+    let pswd_hash_w = hash_password(&login.password.as_str());
+
+    let pswd_hash = match pswd_hash_w {
+        Ok(hash) => hash,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Unknown_error".to_string()),
+    };
+
+    let data = UserPassHash {
+        user: login.username.clone(),
+        hash: pswd_hash.clone(),
+    };
+
+    let saved = save_user(&data);
+
+    let response = format!(
         "Username: {}, Password: {}, Hash: {}",
-        login.username,
-        login.password,
-        pswd_hash.unwrap()
-    )
-    // TODO: store hash to db
+        login.username, login.password, pswd_hash
+    );
+
+    match saved {
+        Ok(_) => (StatusCode::OK, response),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "User not created".to_string(),
+        ),
+    }
 }
 
-async fn token(Form(login): Form<Login>) -> String {
-    let hash = "hash from db".to_string();
-    match verify_password(&login.password, &hash) {
+async fn token(Form(login): Form<Login>) -> (StatusCode, String) {
+    let file_path = format!("{}/{}", DB_PATH, login.username);
+    let file_content = match fs::read_to_string(file_path) {
+        Ok(data) => data,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "Register first".to_string()),
+    };
+    let user_model: Result<UserPassHash, serde_json::Error> = serde_json::from_str(&file_content);
+    let user_model = match user_model {
+        Ok(model) => model,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid user data".to_string()),
+    };
+
+    match verify_password(&login.password, &user_model.hash) {
         Ok(()) => {
             println!("Password is correct");
-            "jwt token".to_string()
+            (StatusCode::OK, "jwt token".to_string())
         }
         Err(_) => {
             println!("Wrong password");
-            "error".to_string()
+            (StatusCode::UNAUTHORIZED, "error".to_string())
         }
     }
+    // TODO: return jwt token
 }
