@@ -3,6 +3,8 @@ use std::{
     io::{Error, Write},
 };
 
+mod jwt_logic;
+
 use argon2::{
     password_hash::{self, rand_core::OsRng, PasswordHasher, SaltString},
     Argon2, PasswordHash, PasswordVerifier,
@@ -28,7 +30,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/token", post(token))
+        .route("/signin", post(sign_in))
         .route("/register", post(register))
         .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
@@ -103,7 +105,7 @@ async fn register(Form(login): Form<Login>) -> (StatusCode, String) {
     }
 }
 
-async fn token(Form(login): Form<Login>) -> (StatusCode, String) {
+async fn sign_in(Form(login): Form<Login>) -> (StatusCode, String) {
     let file_path = format!("{}/{}", DB_PATH, login.username);
     let file_content = match fs::read_to_string(file_path) {
         Ok(data) => data,
@@ -118,12 +120,20 @@ async fn token(Form(login): Form<Login>) -> (StatusCode, String) {
     match verify_password(&login.password, &user_model.hash) {
         Ok(()) => {
             println!("Password is correct");
-            (StatusCode::OK, "jwt token".to_string())
+            match jwt_logic::create_jwt(&login.username, 60) {
+                Ok(token) => (StatusCode::OK, token),
+                Err(e) => {
+                    println!("JWT generation error: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Token generation error".to_string(),
+                    )
+                }
+            }
         }
         Err(_) => {
             println!("Wrong password");
             (StatusCode::UNAUTHORIZED, "error".to_string())
         }
     }
-    // TODO: return jwt token
 }
