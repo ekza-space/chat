@@ -1,26 +1,21 @@
-use std::{
-    fs::{self, File},
-    io::{Error, Write},
-};
-
 mod jwt_logic;
-
 use argon2::{
     password_hash::{self, rand_core::OsRng, PasswordHasher, SaltString},
     Argon2, PasswordHash, PasswordVerifier,
 };
-
 use axum::{
     extract::Form,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+
+extern crate database as db;
+
 use serde::{Deserialize, Serialize};
 use tokio;
 use tower_http::trace::TraceLayer;
-
-static DB_PATH: &str = "db/users";
 
 #[tokio::main]
 async fn main() {
@@ -32,6 +27,7 @@ async fn main() {
         .route("/", get(root))
         .route("/signin", post(sign_in))
         .route("/register", post(register))
+        .route("/users", get(get_all_users))
         .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -53,10 +49,10 @@ struct UserPassHash {
     hash: String,
 }
 
-fn save_user(data: &UserPassHash) -> Result<(), Error> {
-    let json_data = serde_json::to_string(data)?;
-    let mut file = File::create(format!("{}/{}", DB_PATH, data.user))?;
-    file.write_all(json_data.as_bytes())
+async fn get_all_users() -> impl IntoResponse {
+    let users = db::repo::users::get_all_users();
+    let usernames: Vec<String> = users.into_iter().map(|user| user.username).collect();
+    (StatusCode::OK, Json(usernames)).into_response()
 }
 
 fn hash_password(password: &str) -> Result<String, password_hash::Error> {
@@ -84,12 +80,7 @@ async fn register(Form(login): Form<Login>) -> (StatusCode, String) {
         Err(_) => return (StatusCode::BAD_REQUEST, "Unknown_error".to_string()),
     };
 
-    let data = UserPassHash {
-        user: login.username.clone(),
-        hash: pswd_hash.clone(),
-    };
-
-    let saved = save_user(&data);
+    let saved = db::repo::users::create_new_user(&login.username, &pswd_hash.clone());
 
     let response = format!(
         "Username: {}, Password: {}, Hash: {}",
@@ -106,34 +97,38 @@ async fn register(Form(login): Form<Login>) -> (StatusCode, String) {
 }
 
 async fn sign_in(Form(login): Form<Login>) -> (StatusCode, String) {
-    let file_path = format!("{}/{}", DB_PATH, login.username);
-    let file_content = match fs::read_to_string(file_path) {
-        Ok(data) => data,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Register first".to_string()),
-    };
-    let user_model: Result<UserPassHash, serde_json::Error> = serde_json::from_str(&file_content);
-    let user_model = match user_model {
-        Ok(model) => model,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid user data".to_string()),
-    };
+    let user_result = db::repo::users::get_user_by_name(&login.username);
 
-    match verify_password(&login.password, &user_model.hash) {
-        Ok(()) => {
-            println!("Password is correct");
-            match jwt_logic::create_jwt(&login.username, 60) {
-                Ok(token) => (StatusCode::OK, token),
-                Err(e) => {
-                    println!("JWT generation error: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Token generation error".to_string(),
-                    )
+    match user_result {
+        Ok(Some(user)) => match verify_password(&login.password, &user.password_hash) {
+            Ok(()) => {
+                println!("Password is correct");
+                match jwt_logic::create_jwt(&login.username, 60) {
+                    Ok(token) => (StatusCode::OK, token),
+                    Err(e) => {
+                        println!("JWT generation error: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Token generation error".to_string(),
+                        )
+                    }
                 }
             }
+            Err(_) => {
+                println!("Wrong password");
+                (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())
+            }
+        },
+        Ok(None) => {
+            println!("User not found");
+            (StatusCode::UNAUTHORIZED, "User not found".to_string())
         }
-        Err(_) => {
-            println!("Wrong password");
-            (StatusCode::UNAUTHORIZED, "error".to_string())
+        Err(e) => {
+            println!("Database error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
         }
     }
 }
